@@ -1360,32 +1360,24 @@ namespace kicquwp
             Debug.WriteLine("[InitServices] Начало...");
             StatusUpdater?.Invoke("Настраиваем сервисы...");
 
-            // Шлём ВСЕ запросы подряд с микропаузами (rate-limit защита как в Jasmine)
+            // ═══ Только 3 критичных SNAC (kicq сервер не терпит больше 4-х в пачке) ═══
+            // Остальные (02,02 / 03,02 / 04,04 / 09,02) НЕ шлём —
+            // на iserverd это вызывает rate-limit разрыв соединения.
+            // ICBM params (04,02) отправляются позже в InitializeOscarSessionAsync.
+
             await SendSnacAsync(0x01, 0x0E, 0x00, GetNextRequestID(), null);
-            await Task.Delay(30);
+            await Task.Delay(200);
 
             byte[] ssiParamBody = new byte[] { 0x00, 0x0b, 0x00, 0x02, 0x00, 0x0f };
             await SendSnacAsync(0x13, 0x02, 0x00, GetNextRequestID(), ssiParamBody);
-            await Task.Delay(30);
+            await Task.Delay(200);
 
             await SendSnacAsync(0x13, 0x04, 0x00, GetNextRequestID(), null);
-            await Task.Delay(30);
-            await SendSnacAsync(0x02, 0x02, 0x00, GetNextRequestID(), null);
-            await Task.Delay(30);
 
-            byte[] blmParamBody = new byte[] { 0x00, 0x05, 0x00, 0x02, 0x00, 0x03 };
-            await SendSnacAsync(0x03, 0x02, 0x00, GetNextRequestID(), blmParamBody);
-            await Task.Delay(30);
+            Debug.WriteLine("[InitServices] 3 запроса отправлены, ждём ответы...");
 
-            await SendSnacAsync(0x04, 0x04, 0x00, GetNextRequestID(), null);
-            await Task.Delay(30);
-            await SendSnacAsync(0x09, 0x02, 0x00, GetNextRequestID(), null);
-
-            Debug.WriteLine("[InitServices] Все запросы отправлены, ждём ответы...");
-
-            // Один общий цикл — собираем все ответы
+            // Собираем ответы
             bool gotContacts = false;
-            bool gotIcbmParams = false;
             var parsedContacts = new ObservableCollection<Contact>();
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
 
@@ -1394,7 +1386,7 @@ namespace kicquwp
                 var flap = await ReceiveFlapWithTimeout(TimeSpan.FromSeconds(5));
                 if (flap == null || flap.Channel != 0x02 || flap.Data.Length < 10)
                 {
-                    if (gotContacts) break; // если контакты уже есть — выходим при таймауте
+                    if (gotContacts) break;
                     continue;
                 }
 
@@ -1408,26 +1400,6 @@ namespace kicquwp
                 {
                     Debug.WriteLine("[Init] Got SSI params");
                 }
-                else if (snac.Family == 0x04 && snac.Subtype == 0x05)
-                {
-                    ParseIcbmParams(snac.Data);
-                    gotIcbmParams = true;
-                    Debug.WriteLine("[Init] Got ICBM params, sending SNAC(04,02)...");
-                    // ТОЛЬКО ТЕПЕРЬ шлём SetIcbmParameters — после получения 04,05
-                    await SendIcbmParametersAsync();
-                }
-                else if (snac.Family == 0x02 && snac.Subtype == 0x03)
-                {
-                    Debug.WriteLine("[Init] Got location params");
-                }
-                else if (snac.Family == 0x03 && snac.Subtype == 0x03)
-                {
-                    Debug.WriteLine("[Init] Got BLM params");
-                }
-                else if (snac.Family == 0x09 && snac.Subtype == 0x03)
-                {
-                    Debug.WriteLine("[Init] Got privacy params");
-                }
                 else if (snac.Family == 0x01 && snac.Subtype == 0x0F)
                 {
                     Debug.WriteLine("[Init] Got own info");
@@ -1439,16 +1411,9 @@ namespace kicquwp
                     if (!SnacFlags.HasMoreData(snac.Flags))
                     {
                         gotContacts = true;
-                        // Не выходим сразу — ждём ещё ICBM params если не получили
-                        if (gotIcbmParams) break;
+                        break;
                     }
                 }
-            }
-
-            if (!gotIcbmParams)
-            {
-                Debug.WriteLine("[Init] ICBM params not received, sending defaults");
-                await SendIcbmParametersAsync();
             }
 
             // Обновляем коллекцию контактов
