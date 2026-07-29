@@ -1275,163 +1275,99 @@ namespace kicquwp
             Debug.WriteLine("[Init] Starting OSCAR session initialization...");
             try
             {
+                // Stage II: rate-limits handshake
                 var response = await ReceiveSnacWithTimeout(0x0001, 0x0018, TimeSpan.FromSeconds(5));
-                if (response == null)
-                {
-                    Debug.WriteLine("[Init ERROR] Timeout waiting for SNAC 0x01/0x18");
-                    return;
-                }
-                Debug.WriteLine("[Init] Received SNAC 0x01/0x18");
+                if (response == null) { Debug.WriteLine("[Init ERROR] Timeout SNAC 01/18"); return; }
+                Debug.WriteLine("[Init] Received SNAC 01/18");
 
-                // Login Stage II (protocol negotiation), финальная часть по спецификации:
-                // клиент обязан запросить рейт-лимиты SNAC(01,06), получить SNAC(01,07)
-                // и подтвердить их через SNAC(01,08) — только после этого соединение
-                // считается "ready". Раньше этот шаг пропускался и сервер это прощал;
-                // судя по всему, обновлённый iserverd теперь строго этого требует и
-                // рвёт соединение, если ack не пришёл.
                 await SendSnacAsync(0x01, 0x06, 0x0000, GetNextRequestID(), null);
-                var rateLimitsSnac = await ReceiveSnacWithTimeout(0x0001, 0x0007, TimeSpan.FromSeconds(15));
-                if (rateLimitsSnac != null)
-                {
-                    await SendRateLimitsAckAsync(rateLimitsSnac.Data);
-                    Debug.WriteLine("[Init] Rate limits handshake завершён (01,06 -> 01,07 -> 01,08)");
-                }
-                else
-                {
-                    Debug.WriteLine("[Init WARNING] Не получили SNAC(01,07) — сервер может позже разорвать соединение");
-                }
+                var rl = await ReceiveSnacWithTimeout(0x0001, 0x0007, TimeSpan.FromSeconds(15));
+                if (rl != null) { await SendRateLimitsAckAsync(rl.Data); Debug.WriteLine("[Init] Rate limits ack done"); }
+                else Debug.WriteLine("[Init WARNING] No SNAC(01,07)");
 
-                // Отправляем все запросы и получаем контакты
+                // Stage III: ALL service queries + roster (per OSCAR spec)
                 await InitServicesAsync();
-                await Task.Delay(200);
+                await Task.Delay(400);
 
-                // SNAC(02,04) — capabilities
-                await SendClientCapabilitiesAsync();
-                await Task.Delay(200);
-
-                // SNAC(01,1E) — статус
+                // Stage IV: just 3 critical packets
                 await SendSetStatusAsync(statusCode);
-                await Task.Delay(200);
-
-                // активация КЛ
+                await Task.Delay(300);
                 await SendSnacAsync(0x13, 0x07, 0x0000, GetNextRequestID(), null);
-                await Task.Delay(200);
-
-                // SNAC(01,02) — ClientReady
+                await Task.Delay(300);
                 await SendClientReadyAsync();
-                await Task.Delay(200);
+                await Task.Delay(300);
 
-                // Jasmine: дополнительные шаги после roster ack
-                // SNAC(15,02) — запрос собственной контактной инфы
-                await SendOwnInfoRequest();
-                await Task.Delay(100);
-                // SSI Edit — установка visibility
-                await SetVisibilityS();
-                await Task.Delay(100);
-                // SNAC(15,02) — запрос офлайн-сообщений
-                await SendOfflineMsgsRequest();
-                await Task.Delay(100);
+                // Post-login non-critical
+                await SendOwnInfoRequest(); await Task.Delay(200);
+                await SetVisibilityS(); await Task.Delay(200);
+                await SendOfflineMsgsRequest(); await Task.Delay(200);
 
                 await _dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
                 {
                     ((App)Windows.UI.Xaml.Application.Current).NotifyConnected();
                 });
-
-
-                // SNAC(13,07) — активация SSI (после ClientReady как в QIP)
-                
-
-                Debug.WriteLine("[Init] Инициализация завершена");
-
-                // Receive loop НЕ запускаем здесь — его запускает и им владеет
-                // вызывающая сторона (ReconnectService.MonitorLoopAsync), чтобы
-                // не было двух параллельных читателей одного сокета, что само
-                // по себе тоже рвёт соединение с той же ошибкой.
+                Debug.WriteLine("[Init] Session ready");
             }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[Init ERROR] {ex}");
-                throw;
-            }
+            catch (Exception ex) { Debug.WriteLine($"[Init ERROR] {ex}"); throw; }
         }
 
         private async Task InitServicesAsync()
         {
-            Debug.WriteLine("[InitServices] Начало...");
-            StatusUpdater?.Invoke("Настраиваем сервисы...");
+            Debug.WriteLine("[InitServices] Stage III: all services + roster...");
 
-            // ═══ Только 3 критичных SNAC (kicq сервер не терпит больше 4-х в пачке) ═══
-            // Остальные (02,02 / 03,02 / 04,04 / 09,02) НЕ шлём —
-            // на iserverd это вызывает rate-limit разрыв соединения.
-            // ICBM params (04,02) отправляются позже в InitializeOscarSessionAsync.
-
+            // Batch 1: self-info + SSI params + request roster
             await SendSnacAsync(0x01, 0x0E, 0x00, GetNextRequestID(), null);
-            await Task.Delay(200);
-
-            byte[] ssiParamBody = new byte[] { 0x00, 0x0b, 0x00, 0x02, 0x00, 0x0f };
-            await SendSnacAsync(0x13, 0x02, 0x00, GetNextRequestID(), ssiParamBody);
-            await Task.Delay(200);
-
+            await Task.Delay(100);
+            byte[] ssiBody = new byte[] { 0x00, 0x0b, 0x00, 0x02, 0x00, 0x0f };
+            await SendSnacAsync(0x13, 0x02, 0x00, GetNextRequestID(), ssiBody);
+            await Task.Delay(100);
             await SendSnacAsync(0x13, 0x04, 0x00, GetNextRequestID(), null);
+            await Task.Delay(400);
 
-            Debug.WriteLine("[InitServices] 3 запроса отправлены, ждём ответы...");
+            // Batch 2: service limit queries
+            await SendSnacAsync(0x02, 0x02, 0x00, GetNextRequestID(), null);
+            await Task.Delay(100);
+            byte[] blmBody = new byte[] { 0x00, 0x05, 0x00, 0x02, 0x00, 0x03 };
+            await SendSnacAsync(0x03, 0x02, 0x00, GetNextRequestID(), blmBody);
+            await Task.Delay(400);
 
-            // Собираем ответы
+            // Batch 3: ICBM limit + privacy limit + caps + set ICBM params
+            await SendSnacAsync(0x04, 0x04, 0x00, GetNextRequestID(), null);
+            await Task.Delay(100);
+            await SendSnacAsync(0x09, 0x02, 0x00, GetNextRequestID(), null);
+            await Task.Delay(300);
+            await SendClientCapabilitiesAsync();
+            await Task.Delay(100);
+            await SendIcbmParametersAsync();
+            await Task.Delay(400);
+
+            Debug.WriteLine("[InitServices] 10 SNACs sent, waiting for replies...");
+
             bool gotContacts = false;
             var parsedContacts = new ObservableCollection<Contact>();
-            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(25);
 
             while (DateTime.UtcNow < deadline)
             {
                 var flap = await ReceiveFlapWithTimeout(TimeSpan.FromSeconds(5));
                 if (flap == null || flap.Channel != 0x02 || flap.Data.Length < 10)
-                {
-                    if (gotContacts) break;
-                    continue;
-                }
-
+                { if (gotContacts) break; continue; }
                 var snac = SnacPacket.Parse(flap.Data);
                 if (snac == null) continue;
-
-                Debug.WriteLine("[InitServices] SNAC(" + snac.Family.ToString("X2") +
-                                "," + snac.Subtype.ToString("X2") + ")");
-
-                if (snac.Family == 0x13 && snac.Subtype == 0x03)
-                {
-                    Debug.WriteLine("[Init] Got SSI params");
-                }
-                else if (snac.Family == 0x01 && snac.Subtype == 0x0F)
-                {
-                    Debug.WriteLine("[Init] Got own info");
-                }
+                Debug.WriteLine("[InitSvc] SNAC(" + snac.Family.ToString("X2") + "," + snac.Subtype.ToString("X2") + ")");
+                if (snac.Family == 0x04 && snac.Subtype == 0x05) { ParseIcbmParams(snac.Data); }
                 else if (snac.Family == 0x13 && snac.Subtype == 0x06)
                 {
                     ParseContactListPacket(snac.Data, parsedContacts);
-                    Debug.WriteLine("[Init] Got contacts: " + parsedContacts.Count);
-                    if (!SnacFlags.HasMoreData(snac.Flags))
-                    {
-                        gotContacts = true;
-                        break;
-                    }
+                    Debug.WriteLine("[Init] Contacts: " + parsedContacts.Count);
+                    if (!SnacFlags.HasMoreData(snac.Flags)) gotContacts = true;
                 }
             }
 
-            // Обновляем коллекцию контактов
-            if (this.contacts == null)
-            {
-                this.contacts = parsedContacts;
-            }
-            else
-            {
-                await _dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
-                {
-                    this.contacts.Clear();
-                    foreach (var c in parsedContacts)
-                        this.contacts.Add(c);
-                });
-            }
-
-            Debug.WriteLine("[InitServices] Готово. Контактов: " + parsedContacts.Count);
+            if (this.contacts == null) this.contacts = parsedContacts;
+            else await _dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            { this.contacts.Clear(); foreach (var c in parsedContacts) this.contacts.Add(c); });
+            Debug.WriteLine("[InitServices] Done. Contacts: " + parsedContacts.Count);
         }
 
 
