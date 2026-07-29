@@ -808,7 +808,7 @@ namespace kicquwp
             catch (Exception ex)
             {
                 Debug.WriteLine("[SendFlap ERROR] " + ex.Message);
-                FailReader(ex); // единая точка обнаружения обрыва
+                // DO NOT call FailReader here — write errors should not kill the receive loop
                 throw;
             }
         }
@@ -1289,18 +1289,34 @@ namespace kicquwp
                 await InitServicesAsync();
                 await Task.Delay(400);
 
-                // Stage IV: just 3 critical packets
-                await SendSetStatusAsync(statusCode);
-                await Task.Delay(300);
-                await SendSnacAsync(0x13, 0x07, 0x0000, GetNextRequestID(), null);
-                await Task.Delay(300);
+                // ── Stage IV: exact Jasmine packet order from handleServerRoster(flags==0) ──
+                // Jasmine order: caps(02,04) → ICBM(04,02) → ClientReady(01,02) →
+                //                status(01,1E) → ownInfo(15,02) → visibility → rosterAck → offline
+                // caps + ICBM already sent in InitServicesAsync
+
+                // 1) SNAC(01,02) — ClientReady FIRST (before status, per Jasmine!)
                 await SendClientReadyAsync();
                 await Task.Delay(300);
 
-                // Post-login non-critical
-                await SendOwnInfoRequest(); await Task.Delay(200);
-                await SetVisibilityS(); await Task.Delay(200);
-                await SendOfflineMsgsRequest(); await Task.Delay(200);
+                // 2) SNAC(01,1E) — set status + DC info
+                await SendSetStatusAsync(statusCode);
+                await Task.Delay(300);
+
+                // 3) SNAC(15,02) — own contact info request
+                await SendOwnInfoRequest();
+                await Task.Delay(200);
+
+                // 4) SSI Edit — visibility
+                await SetVisibilityS();
+                await Task.Delay(200);
+
+                // 5) SNAC(13,07) — roster ack (LAST in Jasmine!)
+                await SendSnacAsync(0x13, 0x07, 0x0000, GetNextRequestID(), null);
+                await Task.Delay(200);
+
+                // 6) SNAC(15,02) — offline messages request
+                await SendOfflineMsgsRequest();
+                await Task.Delay(200);
 
                 await _dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
                 {
