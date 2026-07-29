@@ -75,7 +75,9 @@ namespace kicquwp
     0x0002, // Location services
     0x0003, // Buddy List management
     0x0004, // Messaging (ICBM)
+    0x0006, // Invitation (server sends this)
     0x0009, // Privacy
+    0x000A, // Search (server sends this)
     0x000B, // Usage stats
     0x0010, // Server-stored buddy icons
     0x0013, // Server Side Information (SSI)
@@ -1289,40 +1291,42 @@ namespace kicquwp
                 await InitServicesAsync();
                 await Task.Delay(400);
 
-                // ── Stage IV: exact Jasmine packet order from handleServerRoster(flags==0) ──
-                // Jasmine order: caps(02,04) → ICBM(04,02) → ClientReady(01,02) →
-                //                status(01,1E) → ownInfo(15,02) → visibility → rosterAck → offline
-                // caps + ICBM already sent in InitServicesAsync
+                // ── Stage IV: BARE MINIMUM — 2 packets exactly per OSCAR spec ──
+                // Spec: SNAC(01,1E) → SNAC(01,02). That's it. Nothing more.
+                // Jasmine adds rosterAck+caps+ownInfo etc, but kicq can't handle it.
 
-                // 1) SNAC(01,02) — ClientReady FIRST (before status, per Jasmine!)
-                await SendClientReadyAsync();
-                await Task.Delay(300);
-
-                // 2) SNAC(01,1E) — set status + DC info
+                // 1) SNAC(01,1E) — set status + DC info
                 await SendSetStatusAsync(statusCode);
-                await Task.Delay(300);
+                await Task.Delay(500);
 
-                // 3) SNAC(15,02) — own contact info request
-                await SendOwnInfoRequest();
-                await Task.Delay(200);
-
-                // 4) SSI Edit — visibility
-                await SetVisibilityS();
-                await Task.Delay(200);
-
-                // 5) SNAC(13,07) — roster ack (LAST in Jasmine!)
+                // 2) SNAC(13,07) — roster ack
                 await SendSnacAsync(0x13, 0x07, 0x0000, GetNextRequestID(), null);
-                await Task.Delay(200);
+                await Task.Delay(500);
 
-                // 6) SNAC(15,02) — offline messages request
-                await SendOfflineMsgsRequest();
-                await Task.Delay(200);
+                // 3) SNAC(01,02) — ClientReady — THIS starts the session
+                await SendClientReadyAsync();
+                await Task.Delay(500);
+
+                // All non-critical packets are DEFERRED — they will be sent
+                // AFTER the receive loop is running, from a background task.
+                // DO NOT send OwnInfo/Visibility/OfflineMsgs during login.
 
                 await _dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
                 {
                     ((App)Windows.UI.Xaml.Application.Current).NotifyConnected();
                 });
                 Debug.WriteLine("[Init] Session ready");
+
+                // Deferred: non-critical packets after 3s breathing room
+                var _ = Task.Run(async () =>
+                {
+                    await Task.Delay(3000);
+                    try { await SendOwnInfoRequest(); } catch { }
+                    await Task.Delay(500);
+                    try { await SetVisibilityS(); } catch { }
+                    await Task.Delay(500);
+                    try { await SendOfflineMsgsRequest(); } catch { }
+                });
             }
             catch (Exception ex) { Debug.WriteLine($"[Init ERROR] {ex}"); throw; }
         }
@@ -4984,8 +4988,8 @@ namespace kicquwp
             {
                 while (!token.IsCancellationRequested)
                 {
-                    // 30 секунд вместо 60 — быстрее обнаруживаем обрыв
-                    await Task.Delay(30000, token);
+                    // 120 секунд — kicq/iserverd не любит частые пинги
+                    await Task.Delay(120000, token);
                     if (token.IsCancellationRequested) break;
 
                     try
