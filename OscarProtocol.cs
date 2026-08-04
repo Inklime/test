@@ -1392,7 +1392,7 @@ namespace kicquwp
                 DebugLogService.Log("[Init] -> SNAC(13,04) roster request");
 
                 bool gotAllContacts = false;
-                var rosterDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+                var rosterDeadline = DateTime.UtcNow + TimeSpan.FromMinutes(2);
                 while (DateTime.UtcNow < rosterDeadline)
                 {
                     var remaining = rosterDeadline - DateTime.UtcNow;
@@ -1407,8 +1407,9 @@ namespace kicquwp
 
                     if (snac.Family == 0x13 && snac.Subtype == 0x06)
                     {
-                        ParseContactListPacket(snac.Data, parsedContacts);
-                        DebugLogService.Log("[Init] SSI roster chunk, total so far: " + parsedContacts.Count);
+                        ParseContactListPacket(snac.Data, parsedContacts, snac.Flags);
+                        DebugLogService.Log("[Init] SSI roster chunk, flags=0x" + snac.Flags.ToString("X4") +
+                                            ", total so far: " + parsedContacts.Count);
                         if (!SnacFlags.HasMoreData(snac.Flags))
                         {
                             gotAllContacts = true;
@@ -1540,7 +1541,7 @@ namespace kicquwp
                 if (snac.Family == 0x04 && snac.Subtype == 0x05) { ParseIcbmParams(snac.Data); }
                 else if (snac.Family == 0x13 && snac.Subtype == 0x06)
                 {
-                    ParseContactListPacket(snac.Data, parsedContacts);
+                    ParseContactListPacket(snac.Data, parsedContacts, snac.Flags);
                     DebugLogService.Log("[Init] Contacts: " + parsedContacts.Count);
                     if (!SnacFlags.HasMoreData(snac.Flags)) gotContacts = true;
                 }
@@ -1942,11 +1943,32 @@ namespace kicquwp
 
         public void ParseContactListPacket(byte[] data, ObservableCollection<Contact> contacts)
         {
+            ParseContactListPacket(data, contacts, 0);
+        }
+
+        public void ParseContactListPacket(byte[] data, ObservableCollection<Contact> contacts, ushort snacFlags)
+        {
             if (data == null || data.Length < 5) return;
 
             try
             {
                 int offset = 0;
+
+                // Multi-part SSI roster replies arrive with SNAC flag 0x8000.
+                // Jasmine skips the leading WORD length + that many bytes before
+                // parsing the actual SSI payload; without this skip a large roster
+                // chunk is parsed as garbage and we may activate SSI before all
+                // chunks have arrived.
+                if ((snacFlags & SnacFlags.MoreData) != 0)
+                {
+                    if (offset + 2 > data.Length) return;
+                    ushort headerLen = ReadU16(data, ref offset);
+                    if (offset + headerLen > data.Length) return;
+                    DebugLogService.Log("[ParseContactListPacket] Skipping SNAC continuation header, len=" + headerLen);
+                    offset += headerLen;
+                }
+
+                if (offset + 3 > data.Length) return;
                 byte version = data[offset++];
                 ushort itemCount = ReadU16(data, ref offset);
                 DebugLogService.Log("[ParseContactListPacket] Item count: " + itemCount);
@@ -5143,9 +5165,9 @@ namespace kicquwp
 
         public static class SnacFlags
         {
-            public const ushort MoreData = 0x0001;     // More data fragments coming
+            public const ushort MoreData = 0x8000;     // More roster fragments/continuation header present
             public const ushort ServerBusy = 0x0002;   // Server is busy
-            public const ushort Error = 0x8000;        // Error response
+            public const ushort Error = 0x0001;        // Error response
 
             public static bool HasMoreData(ushort flags) => (flags & MoreData) != 0;
             public static bool IsServerBusy(ushort flags) => (flags & ServerBusy) != 0;
